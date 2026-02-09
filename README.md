@@ -4,6 +4,7 @@
 
 ```sh
 go install github.com/alesr/lacune@latest
+```
 
 ## Features
 
