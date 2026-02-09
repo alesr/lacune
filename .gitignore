@@ -1,0 +1,4 @@
+lacune
+testdata/*
+.coverage
+cover.out
