@@ -13,7 +13,6 @@ import (
 	"github.com/alesr/lacune/internal/runner"
 	"github.com/alesr/lacune/internal/tui"
 	"golang.org/x/term"
-	"golang.org/x/tools/cover"
 )
 
 const (
@@ -21,6 +20,17 @@ const (
 	defaultProfilePath = defaultProfileDir + "/cover.out"
 	defaultTimeout     = 10 * time.Minute
 )
+
+type flags struct {
+	dir      string
+	coverpkg string
+	profile  string
+	noRun    bool
+	min      float64
+	timeout  time.Duration
+	tags     string
+	runFlag  string
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -30,119 +40,152 @@ func main() {
 }
 
 func run() error {
-	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "Usage of lacune:\n")
-		flag.PrintDefaults()
-	}
+	flags := parseFlags()
 
-	dir := flag.String("dir", ".", "directory to run in")
-	coverpkg := flag.String("coverpkg", "", "passed to go test -coverpkg")
-	profile := flag.String("profile", defaultProfilePath, "path to coverage profile to read/write")
-	noRun := flag.Bool("no-run", false, "do not run tests; only read -profile")
-	min := flag.Float64("min", 0, "minimum total coverage percent; if total < min, exit code != 0")
-	timeout := flag.Duration("timeout", defaultTimeout, "go test timeout")
-	tags := flag.String("tags", "", "build tags")
-	runFlag := flag.String("run", "", "forwarded to go test -run")
-	flag.Parse()
+	if term.IsTerminal(int(os.Stdout.Fd())) {
+		if flags.noRun {
+			fileModels, totals, err := parseProfileAndComputeTotals(flags.profile, flags.dir)
+			if err != nil {
+				return fmt.Errorf("failed to parse profile and compute totals: %w", err)
+			}
+			if flags.min > 0 && totals.Percent < flags.min {
+				return fmt.Errorf("coverage %.2f%% is below minimum %.2f%%", totals.Percent, flags.min)
+			}
+			if err := tui.Run(fileModels, totals, rerunFunc(flags)); err != nil {
+				return fmt.Errorf("could not run TUI: %w", err)
+			}
+			return nil
+		}
 
-	if !*noRun {
-		if err := os.MkdirAll(filepath.Dir(*profile), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(flags.profile), 0o755); err != nil {
 			return fmt.Errorf("failed to create profile directory: %w", err)
 		}
+
+		loader := func() ([]coverage.FileModel, coverage.Totals, tui.LoadDiagnostics, error) {
+			stdout, stderr, err := runTests(context.Background(), flags)
+			if err != nil {
+				return nil, coverage.Totals{}, tui.LoadDiagnostics{Stdout: stdout, Stderr: stderr, Stage: tui.LoadStageTest}, err
+			}
+			fileModels, totals, err := parseProfileAndComputeTotals(flags.profile, flags.dir)
+			if err != nil {
+				return nil, coverage.Totals{}, tui.LoadDiagnostics{Stdout: stdout, Stderr: stderr, Stage: tui.LoadStageParse}, err
+			}
+			if flags.min > 0 && totals.Percent < flags.min {
+				return nil, coverage.Totals{}, tui.LoadDiagnostics{Stdout: stdout, Stderr: stderr, Stage: tui.LoadStageMin}, fmt.Errorf("coverage %.2f%% is below minimum %.2f%%", totals.Percent, flags.min)
+			}
+			return fileModels, totals, tui.LoadDiagnostics{Stdout: stdout, Stderr: stderr}, nil
+		}
+
+		if err := tui.RunWithLoader(loader, rerunFunc(flags)); err != nil {
+			if loadErr, ok := err.(tui.LoadError); ok {
+				if loadErr.Diagnostics.Stage == tui.LoadStageTest {
+					fmt.Fprintf(os.Stderr, "go test failed:\n%s\n%s\n", loadErr.Diagnostics.Stdout, loadErr.Diagnostics.Stderr)
+				}
+				return loadErr.Err
+			}
+			return fmt.Errorf("could not run TUI: %w", err)
+		}
+		return nil
 	}
 
-	var profiles []*cover.Profile
-	if !*noRun {
-		args := []string{"test", "./...", "-coverprofile", *profile}
-		if *coverpkg != "" {
-			args = append(args, "-coverpkg="+*coverpkg)
-		}
-		if *timeout > 0 {
-			args = append(args, "-timeout="+timeout.String())
-		}
-		if *tags != "" {
-			args = append(args, "-tags="+*tags)
-		}
-		if *runFlag != "" {
-			args = append(args, "-run="+*runFlag)
+	if !flags.noRun {
+		if err := os.MkdirAll(filepath.Dir(flags.profile), 0o755); err != nil {
+			return fmt.Errorf("failed to create profile directory: %w", err)
 		}
 
-		r := runner.NewExecRunner()
-		stdout, stderr, err := r.Run(context.Background(), *dir, args)
+		stdout, stderr, err := runTests(context.Background(), flags)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "go test failed:\n%s\n%s\n", stdout, stderr)
 			return fmt.Errorf("go test failed: %w", err)
 		}
 	}
 
-	// parse coverage profile
-	var err error
-	profiles, err = coverage.Load(*profile)
+	fileModels, totals, err := parseProfileAndComputeTotals(flags.profile, flags.dir)
 	if err != nil {
-		return fmt.Errorf("failed to load coverage profile: %w", err)
+		return fmt.Errorf("failed to parse profile and compute totals: %w", err)
 	}
 
-	// compute totals
-	totals := coverage.ComputeTotals(profiles)
-	if *min > 0 && totals.Percent < *min {
-		return fmt.Errorf("coverage %.2f%% is below minimum %.2f%%", totals.Percent, *min)
+	if flags.min > 0 && totals.Percent < flags.min {
+		return fmt.Errorf("coverage %.2f%% is below minimum %.2f%%", totals.Percent, flags.min)
 	}
 
-	// build file models for TUI/text report
-	fileModels, err := coverage.BuildFileModels(profiles, *dir)
-	if err != nil {
-		return fmt.Errorf("failed to build file models: %w", err)
+	report.Print(os.Stdout, totals, fileModels, 10)
+	return nil
+}
+
+func parseFlags() flags {
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage of lacune:\n")
+		flag.PrintDefaults()
 	}
+	flags := flags{
+		dir:      *flag.String("dir", ".", "directory to run in"),
+		coverpkg: *flag.String("coverpkg", "", "passed to go test -coverpkg"),
+		profile:  *flag.String("profile", defaultProfilePath, "path to coverage profile to read/write"),
+		noRun:    *flag.Bool("no-run", false, "do not run tests"),
+		min:      *flag.Float64("min", 0, "minimum total coverage percent; if total < min, exit code != 0"),
+		timeout:  *flag.Duration("timeout", defaultTimeout, "go test timeout"),
+		tags:     *flag.String("tags", "", "build tags"),
+		runFlag:  *flag.String("run", "", "forwarded to go test -run"),
+	}
+	flag.Parse()
+	return flags
+}
 
-	// define rerun function
-	rerunFunc := func() ([]coverage.FileModel, coverage.Totals, error) {
-		// run tests
-		args := []string{"test", "./...", "-coverprofile", *profile}
-		if *coverpkg != "" {
-			args = append(args, "-coverpkg="+*coverpkg)
+func rerunFunc(f flags) func() ([]coverage.FileModel, coverage.Totals, error) {
+	return func() ([]coverage.FileModel, coverage.Totals, error) {
+		if _, _, err := runTests(context.Background(), f); err != nil {
+			return nil, coverage.Totals{}, fmt.Errorf("could not run tests and compute totals: %w", err)
 		}
-		if *timeout > 0 {
-			args = append(args, "-timeout="+timeout.String())
-		}
-		if *tags != "" {
-			args = append(args, "-tags="+*tags)
-		}
-		if *runFlag != "" {
-			args = append(args, "-run="+*runFlag)
-		}
-
-		r := runner.NewExecRunner()
-		stdout, stderr, err := r.Run(context.Background(), *dir, args)
+		fileModels, totals, err := parseProfileAndComputeTotals(f.profile, f.dir)
 		if err != nil {
-			return nil, coverage.Totals{}, fmt.Errorf("go test failed: %w\n%s\n%s", err, stdout, stderr)
-		}
-
-		// parse coverage profile
-		profiles, err := coverage.Load(*profile)
-		if err != nil {
-			return nil, coverage.Totals{}, fmt.Errorf("failed to load coverage profile: %w", err)
-		}
-
-		// compute totals
-		totals := coverage.ComputeTotals(profiles)
-
-		// build file models
-		fileModels, err := coverage.BuildFileModels(profiles, *dir)
-		if err != nil {
-			return nil, coverage.Totals{}, fmt.Errorf("failed to build file models: %w", err)
+			return nil, coverage.Totals{}, fmt.Errorf("could not parse profile and compute totals: %w", err)
 		}
 		return fileModels, totals, nil
 	}
+}
 
-	// decide output mode (tui vs text)
-	isTTY := term.IsTerminal(int(os.Stdout.Fd()))
-	text := flag.Bool("text", false, "force text output (no TUI)")
-	if isTTY && !*text {
-		if err := tui.Run(fileModels, totals, rerunFunc); err != nil {
-			return fmt.Errorf("TUI failed: %w", err)
-		}
-	} else {
-		report.Print(os.Stdout, totals, fileModels, 10)
+func runTests(ctx context.Context, f flags) (string, string, error) {
+	r := runner.NewExecRunner()
+
+	ctx, cancel := context.WithTimeout(context.Background(), f.timeout)
+	defer cancel()
+
+	stdout, stderr, err := r.Run(ctx, f.dir, makeTestArgs(f))
+	if err != nil {
+		return "", "", fmt.Errorf("go test failed: %w", err)
 	}
-	return nil
+	return stdout, stderr, nil
+}
+
+func makeTestArgs(f flags) []string {
+	args := []string{"test", "./...", "-coverprofile", f.profile}
+	if f.coverpkg != "" {
+		args = append(args, "-coverpkg="+f.coverpkg)
+	}
+	if f.timeout > 0 {
+		args = append(args, "-timeout="+f.timeout.String())
+	}
+	if f.tags != "" {
+		args = append(args, "-tags="+f.tags)
+	}
+	if f.runFlag != "" {
+		args = append(args, "-run="+f.runFlag)
+	}
+	return args
+}
+
+func parseProfileAndComputeTotals(profile, dir string) ([]coverage.FileModel, coverage.Totals, error) {
+	profiles, err := coverage.Load(profile)
+	if err != nil {
+		return nil, coverage.Totals{}, fmt.Errorf("could not load coverage profile: %w", err)
+	}
+
+	totals := coverage.ComputeTotals(profiles)
+
+	fileModels, err := coverage.BuildFileModels(profiles, dir)
+	if err != nil {
+		return nil, coverage.Totals{}, fmt.Errorf("failed to build file models: %w", err)
+	}
+	return fileModels, totals, nil
 }
