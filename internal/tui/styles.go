@@ -3,11 +3,11 @@ package tui
 import "github.com/charmbracelet/lipgloss"
 
 const (
-	colorCovered        = "#7D56F4"
+	colorCovered        = "#06B6D4" // cyan accent
 	colorUncovered      = "252"
 	colorError          = "9"
 	colorHighlight      = "#FAFAFA"
-	colorBorder         = "#7D56F4"
+	colorBorder         = "#06B6D4"
 	colorBorderInactive = "240"
 	colorNeutral        = "240" // gray: secondary/explanatory text
 
