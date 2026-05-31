@@ -13,7 +13,7 @@ go install github.com/alesr/lacune@latest
 - scroll through and search code
 - measure GC behavior of your test suite (wall time + gctrace telemetry)
 
-![lacune demo](assets/demo.gif)
+https://github.com/user-attachments/assets/0299e3bf-e755-4c18-bc1b-737b8010c313
 
 ## Usage
 
@@ -37,21 +37,6 @@ The report measures:
 - **Peak heap** — largest heap size observed during a GC cycle
 
 Telemetry comes from `GODEBUG=gctrace=1`. A compile-only warm-up pass runs first so wall time reflects test execution, not compilation.
-
-### Keys
-
-| Key       | Action                                              |
-| --------- | --------------------------------------------------- |
-| `b`       | Open / close GC report                              |
-| `+` / `-` | More / fewer iterations (`go test -count`, default **3**) |
-| `t`       | Toggle Docker isolation (pinned 2 CPU cores, 512 MB RAM) |
-| `Enter`   | Run                                                 |
-| `?`       | Metric guide (in results view)                      |
-| `Esc`     | Cancel (while running) or close                     |
-
-This measures your **test suite**, not production traffic — but it exercises *your* code, not a synthetic benchmark. Docker and host runs use different environments, so compare like with like.
-
-The logic lives in [`pkg/gcbench`](pkg/gcbench/) and is wired into the TUI from `main.go`.
 
 ## Contribute
 
