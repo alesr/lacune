@@ -2,21 +2,25 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/alesr/lacune/internal/coverage"
+	"github.com/alesr/lacune/pkg/gcbench"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/fatih/color"
 )
 
 const (
-	footer              = "[↑/↓] navigate  [tab] switch focus  [r] rerun  [d] details  [q] quit  [/] filter"
+	footer              = "[↑/↓] navigate  [tab] switch focus  [r] rerun  [d] details  [b] bench  [q] quit  [/] filter"
 	footerDetails       = "[↑/↓] scroll  [d] close  [q] quit"
+	footerBenchPicker   = "[+/-] iterations  [t] docker  [enter] run  [esc] close"
+	footerBenchRunning  = "[esc] cancel"
+	footerBenchResults  = "[↑/↓] scroll  [?] explain  [b/esc] close"
 	moduleNameUnknown   = "unknown"
 	fileListWidthRatio  = 0.3
 	headerFooterHeight  = 6
@@ -57,7 +61,22 @@ type (
 	}
 
 	loadingTickMsg struct{}
+
+	benchEvent struct {
+		stage  string
+		result *gcbench.Result
+		err    error
+	}
+
+	benchEventMsg benchEvent
+
+	benchTickMsg struct{}
 )
+
+// BenchRunner runs a GC comparison with the given iteration count, optionally
+// reporting progress via onProgress. It is injected so the TUI stays decoupled
+// from exec/docker concerns.
+type BenchRunner func(ctx context.Context, useDocker bool, count int, onProgress func(string)) (gcbench.Result, error)
 
 type Model struct {
 	fileList    *fileListModel
@@ -66,12 +85,17 @@ type Model struct {
 	keybindings keybindingModel
 	focus       FocusModel
 	packageView packageViewModel
+	benchView   benchViewModel
 	files       []coverage.FileModel
 	currentFile int
 	moduleName  string
 	packageName string
 	filterQuery string
 	rerunFunc   func() ([]coverage.FileModel, coverage.Totals, error)
+	benchFunc   BenchRunner
+	benchChan   chan benchEvent
+	benchCancel context.CancelFunc
+	benchTick   int
 	statusMsg   string
 	loading     bool
 	loader      func() ([]coverage.FileModel, coverage.Totals, LoadDiagnostics, error)
@@ -82,7 +106,7 @@ type Model struct {
 	height      int
 }
 
-func NewModel(files []coverage.FileModel, totals coverage.Totals, rerunFunc func() ([]coverage.FileModel, coverage.Totals, error)) Model {
+func NewModel(files []coverage.FileModel, totals coverage.Totals, rerunFunc func() ([]coverage.FileModel, coverage.Totals, error), benchFunc BenchRunner) Model {
 	moduleName, err := getModuleName()
 	if err != nil {
 		moduleName = moduleNameUnknown
@@ -99,6 +123,7 @@ func NewModel(files []coverage.FileModel, totals coverage.Totals, rerunFunc func
 	keybindings := newKeybindingModel(keys)
 	focus := newFocusModel()
 	packageView := newPackageViewModel()
+	benchView := newBenchViewModel()
 
 	if len(files) > 0 {
 		fileList = fileList.Select(0)
@@ -111,12 +136,14 @@ func NewModel(files []coverage.FileModel, totals coverage.Totals, rerunFunc func
 		keybindings: keybindings,
 		focus:       focus,
 		packageView: packageView,
+		benchView:   benchView,
 		files:       files,
 		currentFile: 0,
 		moduleName:  moduleName,
 		packageName: packageName,
 		filterQuery: "",
 		rerunFunc:   rerunFunc,
+		benchFunc:   benchFunc,
 		statusMsg:   "",
 	}
 }
@@ -128,8 +155,9 @@ func (model Model) Init() tea.Cmd {
 func NewLoadingModel(
 	loader func() ([]coverage.FileModel, coverage.Totals, LoadDiagnostics, error),
 	rerunFunc func() ([]coverage.FileModel, coverage.Totals, error),
+	benchFunc BenchRunner,
 ) Model {
-	model := NewModel(nil, coverage.Totals{}, rerunFunc)
+	model := NewModel(nil, coverage.Totals{}, rerunFunc, benchFunc)
 	model.loading = true
 	model.loader = loader
 	return model
@@ -168,7 +196,57 @@ func loadingTick() tea.Cmd {
 	})
 }
 
+func benchTick() tea.Cmd {
+	return tea.Tick(loadingTickInterval, func(time.Time) tea.Msg {
+		return benchTickMsg{}
+	})
+}
+
+// startBench launches the selected benchmark in a goroutine, streaming progress
+// and the final result/error through a channel consumed by waitForBench.
+func (model Model) startBench() (Model, tea.Cmd) {
+	useDocker := model.benchView.UseDocker()
+	count := model.benchView.Count()
+	benchFunc := model.benchFunc
+
+	ch := make(chan benchEvent, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	model.benchChan = ch
+	model.benchCancel = cancel
+	model.benchTick = 0
+	model.benchView = model.benchView.SetRunning("Starting benchmark...")
+
+	go func() {
+		res, err := benchFunc(ctx, useDocker, count, func(stage string) {
+			ch <- benchEvent{stage: stage}
+		})
+		if err != nil {
+			ch <- benchEvent{err: err}
+		} else {
+			ch <- benchEvent{result: &res}
+		}
+		close(ch)
+	}()
+
+	return model, tea.Batch(waitForBench(ch), benchTick())
+}
+
+func waitForBench(ch chan benchEvent) tea.Cmd {
+	return func() tea.Msg {
+		ev, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return benchEventMsg(ev)
+	}
+}
+
 func (model Model) handleKeyMsg(msg tea.KeyMsg) (Model, tea.Cmd) {
+	if model.benchView.IsOpen() {
+		return model.handleBenchKey(msg)
+	}
+
 	cmd, newFocus := model.keybindings.HandleKeyMsg(msg, model.focus.getFocus())
 	if key.Matches(msg, model.keybindings.KeyMap().quit) {
 		return model, tea.Quit
@@ -228,6 +306,13 @@ func (model Model) handleKeyMsg(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return model, nil
 	}
 
+	if key.Matches(msg, model.keybindings.KeyMap().bench) {
+		if model.benchFunc != nil {
+			model.benchView = model.benchView.Open()
+		}
+		return model, nil
+	}
+
 	if key.Matches(msg, model.keybindings.KeyMap().rerun) {
 		if model.rerunFunc != nil {
 			model.statusMsg = statusMsgRerun
@@ -236,6 +321,53 @@ func (model Model) handleKeyMsg(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return model, nil
 	}
 	return model, cmd
+}
+
+// handleBenchKey routes key input while the benchmark overlay is open. It fully
+// owns input (consuming all keys) so the overlay behaves like a modal.
+func (model Model) handleBenchKey(msg tea.KeyMsg) (Model, tea.Cmd) {
+	keys := model.keybindings.KeyMap()
+
+	switch model.benchView.State() {
+	case benchReady:
+		switch {
+		case key.Matches(msg, keys.incIters):
+			model.benchView = model.benchView.IncCount()
+		case key.Matches(msg, keys.decIters):
+			model.benchView = model.benchView.DecCount()
+		case key.Matches(msg, keys.dockerToggle):
+			model.benchView = model.benchView.ToggleDocker()
+		case key.Matches(msg, keys.confirm):
+			if model.benchFunc != nil {
+				return model.startBench()
+			}
+		case key.Matches(msg, keys.bench), key.Matches(msg, keys.quit):
+			model.benchView = model.benchView.Close()
+		}
+		return model, nil
+	case benchRunning:
+		if key.Matches(msg, keys.quit) {
+			if model.benchCancel != nil {
+				model.benchCancel()
+				model.benchCancel = nil
+			}
+			model.benchChan = nil
+			model.benchView = model.benchView.Open()
+		}
+		return model, nil
+	default: // benchResults, benchError
+		switch {
+		case key.Matches(msg, keys.help) && model.benchView.State() == benchResults:
+			model.benchView = model.benchView.ToggleHelp()
+		case key.Matches(msg, keys.up):
+			model.benchView = model.benchView.ScrollUp(1)
+		case key.Matches(msg, keys.down):
+			model.benchView = model.benchView.ScrollDown(1)
+		case key.Matches(msg, keys.bench), key.Matches(msg, keys.quit):
+			model.benchView = model.benchView.Close()
+		}
+		return model, nil
+	}
 }
 
 func (model Model) handleWindowSizeMsg(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
@@ -343,9 +475,34 @@ func (model Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			model.packageView = model.packageView.SetContent(content)
 		}
 		return model, cmd
+	case benchEventMsg:
+		if model.benchView.State() != benchRunning {
+			return model, nil
+		}
+		switch {
+		case msg.err != nil:
+			model.benchChan = nil
+			model.benchCancel = nil
+			model.benchView = model.benchView.SetError(msg.err)
+			return model, nil
+		case msg.result != nil:
+			model.benchView = model.benchView.SetResult(buildBenchContent(*msg.result))
+			model.benchChan = nil
+			model.benchCancel = nil
+			return model, nil
+		default:
+			model.benchView = model.benchView.SetProgress(msg.stage)
+			return model, waitForBench(model.benchChan)
+		}
+	case benchTickMsg:
+		if model.benchView.IsOpen() && model.benchView.State() == benchRunning {
+			model.benchTick = (model.benchTick + 1) % len(loadingFrames)
+			return model, benchTick()
+		}
+		return model, nil
 	}
 
-	if model.packageView.IsOpen() {
+	if model.packageView.IsOpen() || model.benchView.IsOpen() {
 		return model, tea.Batch(cmds...)
 	}
 
@@ -391,6 +548,10 @@ func (model Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (model Model) View() string {
 	if model.loading {
 		return model.loadingView()
+	}
+
+	if model.benchView.IsOpen() {
+		return model.benchOverlayView()
 	}
 
 	if len(model.files) == 0 {
@@ -440,6 +601,37 @@ func (model Model) View() string {
 	)
 }
 
+func (model Model) benchOverlayView() string {
+	var currentFile coverage.FileModel
+	if model.currentFile >= 0 && model.currentFile < len(model.files) {
+		currentFile = model.files[model.currentFile]
+	}
+	headerView := model.header.View(model.packageName, currentFile)
+
+	frame := loadingFrames[model.benchTick%len(loadingFrames)]
+	benchView := model.benchView.View(frame)
+
+	benchBorderStyle := lipgloss.NewStyle().Width(model.benchView.width + borderWidth)
+	benchBorderStyle = applyBorder(benchBorderStyle, true)
+
+	foot := footerBenchPicker
+	switch model.benchView.State() {
+	case benchRunning:
+		foot = footerBenchRunning
+	case benchResults, benchError:
+		foot = footerBenchResults
+	case benchReady:
+		foot = footerBenchPicker
+	}
+
+	return lipgloss.JoinVertical(
+		lipgloss.Left,
+		headerView,
+		benchBorderStyle.Render(benchView),
+		foot,
+	)
+}
+
 func (model Model) loadingView() string {
 	styles := defaultStyles()
 	frame := loadingFrames[model.loadingTick%len(loadingFrames)]
@@ -465,11 +657,12 @@ func (model Model) resize(width, height int) Model {
 	newModel.fileList = newModel.fileList.SetSize(fileListContentWidth, contentHeight)
 	newModel.viewport = newModel.viewport.setSize(viewportContentWidth, contentHeight)
 	newModel.packageView = newModel.packageView.SetSize(width-borderWidth, contentHeight)
+	newModel.benchView = newModel.benchView.SetSize(width-borderWidth, contentHeight)
 	return newModel
 }
 
-func Run(files []coverage.FileModel, totals coverage.Totals, rerunFunc func() ([]coverage.FileModel, coverage.Totals, error)) error {
-	model := NewModel(files, totals, rerunFunc)
+func Run(files []coverage.FileModel, totals coverage.Totals, rerunFunc func() ([]coverage.FileModel, coverage.Totals, error), benchFunc BenchRunner) error {
+	model := NewModel(files, totals, rerunFunc, benchFunc)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		return fmt.Errorf("could not run TUI: %w", err)
@@ -477,8 +670,8 @@ func Run(files []coverage.FileModel, totals coverage.Totals, rerunFunc func() ([
 	return nil
 }
 
-func RunWithLoader(loader func() ([]coverage.FileModel, coverage.Totals, LoadDiagnostics, error), rerunFunc func() ([]coverage.FileModel, coverage.Totals, error)) error {
-	model := NewLoadingModel(loader, rerunFunc)
+func RunWithLoader(loader func() ([]coverage.FileModel, coverage.Totals, LoadDiagnostics, error), rerunFunc func() ([]coverage.FileModel, coverage.Totals, error), benchFunc BenchRunner) error {
+	model := NewLoadingModel(loader, rerunFunc, benchFunc)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	finalModel, err := p.Run()
 	if err != nil {
@@ -567,19 +760,6 @@ func highlightLine(lineText, query string) string {
 	}
 	result.WriteString(lineText[lastIndex:]) // remaining text
 	return result.String()
-}
-
-func statusSymbol(status coverage.LineStatus) string {
-	switch status {
-	case coverage.Covered:
-		return color.GreenString("✓")
-	case coverage.Uncovered:
-		return color.RedString("!")
-	case coverage.Partial:
-		return color.YellowString("~")
-	default:
-		return color.HiBlackString(" ")
-	}
 }
 
 // findFileIndex finds the index of a file by path.
