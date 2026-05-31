@@ -67,6 +67,7 @@ func (viewport viewportModel) renderViewportContent(file coverage.FileModel, fil
 	var content strings.Builder
 	newModel.lineStatus = make([]lineStatus, len(file.LineInfo))
 	lowerQuery := strings.ToLower(filterQuery)
+	styles := defaultStyles()
 
 	for i, line := range file.LineInfo {
 		lineText := line.Text
@@ -78,12 +79,17 @@ func (viewport viewportModel) renderViewportContent(file coverage.FileModel, fil
 			newModel.matchLines = append(newModel.matchLines, i)
 		}
 
-		formattedLine := fmt.Sprintf("%4d %s %s", line.LineNo, statusSymbol(line.Status), lineText)
+		plain := fmt.Sprintf("%4d  %s", line.LineNo, lineText)
 		if newModel.width > 0 {
-			formattedLine = ansi.TruncateWc(formattedLine, newModel.width, "")
+			plain = ansi.TruncateWc(plain, newModel.width, "")
 		}
 
-		content.WriteString(formattedLine + "\n")
+		lineStyle := styles.forLineStatus(line.Status)
+		if newModel.width > 0 {
+			lineStyle = lineStyle.Width(newModel.width)
+		}
+
+		content.WriteString(lineStyle.Render(plain) + "\n")
 		newModel.lineStatus[i] = lineStatus{
 			lineNo: line.LineNo,
 			status: line.Status,

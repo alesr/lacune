@@ -13,7 +13,6 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/fatih/color"
 )
 
 const (
@@ -761,19 +760,6 @@ func highlightLine(lineText, query string) string {
 	}
 	result.WriteString(lineText[lastIndex:]) // remaining text
 	return result.String()
-}
-
-func statusSymbol(status coverage.LineStatus) string {
-	switch status {
-	case coverage.Covered:
-		return color.GreenString("✓")
-	case coverage.Uncovered:
-		return color.RedString("!")
-	case coverage.Partial:
-		return color.YellowString("~")
-	default:
-		return color.HiBlackString(" ")
-	}
 }
 
 // findFileIndex finds the index of a file by path.
