@@ -3,23 +3,31 @@ package tui
 import "github.com/charmbracelet/bubbles/key"
 
 type keyMap struct {
-	up      key.Binding
-	down    key.Binding
-	tab     key.Binding
-	rerun   key.Binding
-	quit    key.Binding
-	filter  key.Binding
-	details key.Binding
+	up           key.Binding
+	down         key.Binding
+	tab          key.Binding
+	rerun        key.Binding
+	quit         key.Binding
+	filter       key.Binding
+	details      key.Binding
+	bench        key.Binding
+	confirm      key.Binding
+	dockerToggle key.Binding
+	help         key.Binding
+	incIters     key.Binding
+	decIters     key.Binding
 }
 
-func (k keyMap) ShortHelp() []key.Binding { return []key.Binding{k.tab, k.rerun, k.details, k.quit} }
+func (k keyMap) ShortHelp() []key.Binding {
+	return []key.Binding{k.tab, k.rerun, k.details, k.bench, k.quit}
+}
 
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.up, k.down},
 		{k.tab},
 		{k.rerun},
-		{k.details, k.filter, k.quit},
+		{k.details, k.bench, k.filter, k.quit},
 	}
 }
 
@@ -52,6 +60,30 @@ func defaultKeyMap() keyMap {
 		details: key.NewBinding(
 			key.WithKeys("d"),
 			key.WithHelp("d", "details"),
+		),
+		bench: key.NewBinding(
+			key.WithKeys("b"),
+			key.WithHelp("b", "benchmark gc"),
+		),
+		confirm: key.NewBinding(
+			key.WithKeys("enter"),
+			key.WithHelp("enter", "run"),
+		),
+		dockerToggle: key.NewBinding(
+			key.WithKeys("t"),
+			key.WithHelp("t", "toggle docker"),
+		),
+		help: key.NewBinding(
+			key.WithKeys("?"),
+			key.WithHelp("?", "explain metrics"),
+		),
+		incIters: key.NewBinding(
+			key.WithKeys("+", "="),
+			key.WithHelp("+", "more iterations"),
+		),
+		decIters: key.NewBinding(
+			key.WithKeys("-"),
+			key.WithHelp("-", "fewer iterations"),
 		),
 	}
 }

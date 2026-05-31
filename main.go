@@ -12,6 +12,7 @@ import (
 	"github.com/alesr/lacune/internal/report"
 	"github.com/alesr/lacune/internal/runner"
 	"github.com/alesr/lacune/internal/tui"
+	"github.com/alesr/lacune/pkg/gcbench"
 	"golang.org/x/term"
 )
 
@@ -51,7 +52,7 @@ func run() error {
 			if flags.min > 0 && totals.Percent < flags.min {
 				return fmt.Errorf("coverage %.2f%% is below minimum %.2f%%", totals.Percent, flags.min)
 			}
-			if err := tui.Run(fileModels, totals, rerunFunc(flags)); err != nil {
+			if err := tui.Run(fileModels, totals, rerunFunc(flags), benchFunc(flags)); err != nil {
 				return fmt.Errorf("could not run TUI: %w", err)
 			}
 			return nil
@@ -76,7 +77,7 @@ func run() error {
 			return fileModels, totals, tui.LoadDiagnostics{Stdout: stdout, Stderr: stderr}, nil
 		}
 
-		if err := tui.RunWithLoader(loader, rerunFunc(flags)); err != nil {
+		if err := tui.RunWithLoader(loader, rerunFunc(flags), benchFunc(flags)); err != nil {
 			if loadErr, ok := err.(tui.LoadError); ok {
 				if loadErr.Diagnostics.Stage == tui.LoadStageTest {
 					fmt.Fprintf(os.Stderr, "go test failed:\n%s\n%s\n", loadErr.Diagnostics.Stdout, loadErr.Diagnostics.Stderr)
@@ -142,6 +143,17 @@ func rerunFunc(f flags) func() ([]coverage.FileModel, coverage.Totals, error) {
 			return nil, coverage.Totals{}, fmt.Errorf("could not parse profile and compute totals: %w", err)
 		}
 		return fileModels, totals, nil
+	}
+}
+
+func benchFunc(f flags) tui.BenchRunner {
+	return func(ctx context.Context, useDocker bool, count int, onProgress func(string)) (gcbench.Result, error) {
+		return gcbench.Run(ctx, gcbench.Options{
+			TargetModulePath: f.dir,
+			UseDocker:        useDocker,
+			Count:            count,
+			OnProgress:       onProgress,
+		})
 	}
 }
 

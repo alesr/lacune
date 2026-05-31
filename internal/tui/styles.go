@@ -9,6 +9,7 @@ const (
 	colorHighlight      = "#FAFAFA"
 	colorBorder         = "#7D56F4"
 	colorBorderInactive = "240"
+	colorNeutral        = "240" // gray: secondary/explanatory text
 
 	statusMsgNone    = "No coverage data available"
 	statusMsgRerun   = "Rerunning tests..."
@@ -29,6 +30,7 @@ type styles struct {
 	normalDesc     lipgloss.Style
 	selectedTitle  lipgloss.Style
 	selectedDesc   lipgloss.Style
+	neutral        lipgloss.Style
 }
 
 func defaultStyles() styles {
@@ -45,5 +47,6 @@ func defaultStyles() styles {
 		normalDesc:     lipgloss.NewStyle().Foreground(lipgloss.Color("250")),
 		selectedTitle:  lipgloss.NewStyle().Foreground(lipgloss.Color(colorCovered)).Bold(true),
 		selectedDesc:   lipgloss.NewStyle().Foreground(lipgloss.Color("250")),
+		neutral:        lipgloss.NewStyle().Foreground(lipgloss.Color(colorNeutral)),
 	}
 }
